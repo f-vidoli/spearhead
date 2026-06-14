@@ -2,17 +2,11 @@
 """
 spearhead - A curses-based learning tool using the "spear & expand" method.
 Supports Google Gemini and local models via Ollama.
-All generation is triggered manually by the user.
-Content appears in real time as it is generated.
-Personalised tone via ~/.spearhead_tone (or --tone-file).
 Switch models inside the app with 'm' – shows installed Ollama models
 and multiple Gemini options. Model name permanently displayed in footer.
 Content scrolling uses LEFT/RIGHT arrows as page-up/page-down.
 On save ('s'), automatically exports PDF to Google Drive using spearhead_export.py.
-Verbose logging with -v prints export logs after quitting.
-
-Now the initial overview generates the full content of every chapter in a single request,
-eliminating the need to expand chapters one by one and maximising content per quota.
+Verbose logging with -v prints AI and export logs after quitting.
 
 Requirements:
     pip install google-genai   (and on Windows: pip install windows-curses)
@@ -24,7 +18,7 @@ Run:
     python spearhead.py --topic "Physics"
     python spearhead.py --local --local-model gemma3:1b
     python spearhead.py --tone-file /path/to/tone.txt
-    python spearhead.py -v              # prints export logs after exit
+    python spearhead.py -v              # prints AI and export logs after exit
 """
 
 import os
@@ -37,6 +31,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple, Callable
 from abc import ABC, abstractmethod
+import re
 
 
 # ----------------------------------------------------------------------
@@ -45,6 +40,7 @@ from abc import ABC, abstractmethod
 class BaseAIClient(ABC):
     def __init__(self):
         self.tone = ""
+        self.last_raw_response = ""
 
     def set_tone(self, tone_text: str):
         self.tone = tone_text
@@ -54,26 +50,14 @@ class BaseAIClient(ABC):
             return f"{prompt}\n\nStyle instructions: {self.tone}"
         return prompt
 
+    # ----- Prompt builders -----
     def _build_overview_prompt(self, topic: str) -> str:
-        """Old prompt – kept for fallback compatibility."""
+        """Prompt for introduction + chapter titles only."""
         prompt = (
             f'You are an expert tutor. For the topic "{topic}", produce a learning outline as JSON.\n'
             f'The JSON must contain exactly two fields:\n'
             f'- "introduction": a string of 3-5 paragraphs, very broad and engaging (no markdown).\n'
             f'- "chapters": a list of 6-12 chapter titles (strings only, high-level, no descriptions).\n\n'
-            f'Output ONLY valid JSON, no other text.'
-        )
-        return self._add_tone_to_prompt(prompt)
-
-    def _build_full_overview_prompt(self, topic: str) -> str:
-        """Prompt that generates introduction + all chapter contents in one go."""
-        prompt = (
-            f'You are an expert tutor. For the topic "{topic}", produce a comprehensive learning document as JSON.\n'
-            f'The JSON must contain exactly two fields:\n'
-            f'- "introduction": a string of 3-5 paragraphs, broad and engaging (no markdown).\n'
-            f'- "chapters": a list of 6-12 objects, each with:\n'
-            f'    * "title": a string (the chapter title)\n'
-            f'    * "content": a detailed explanation of that chapter, 400-800 words, plain text, no markdown.\n\n'
             f'Output ONLY valid JSON, no other text.'
         )
         return self._add_tone_to_prompt(prompt)
@@ -103,28 +87,34 @@ class BaseAIClient(ABC):
             )
         return self._add_tone_to_prompt(prompt)
 
-    def _parse_overview_response(self, text: str) -> Tuple[str, List[str]]:
-        """Parse old‑style overview (introduction + chapter titles)."""
-        text = text.strip()
-        for fence in ("```json", "```"):
-            if text.startswith(fence):
-                text = text[len(fence):]
-        if text.endswith("```"):
-            text = text[:-3]
-        try:
-            data = json.loads(text.strip())
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"AI returned invalid JSON: {e}") from e
-        if "introduction" not in data or "chapters" not in data:
-            raise RuntimeError("AI response missing required fields 'introduction' or 'chapters'")
-        if not isinstance(data["chapters"], list) or not data["chapters"]:
-            raise RuntimeError("AI response 'chapters' must be a non-empty list")
-        if not isinstance(data["introduction"], str):
-            raise RuntimeError("AI response 'introduction' must be a string")
-        return data["introduction"], data["chapters"]
+    def _build_tagged_overview_prompt(self, topic: str) -> str:
+        """Prompt for introduction + all chapter contents (tag‑based, used by 'f')."""
+        prompt = (
+            f'You are an expert tutor. For the topic "{topic}", produce a comprehensive learning document.\n'
+            f'Use the following format EXACTLY:\n\n'
+            f'[INTRODUCTION]\n'
+            f'Write a broad, engaging introduction of 3-5 paragraphs. No markdown.\n\n'
+            f'[NEW CHAPTER]\n'
+            f'Chapter Title Here\n'
+            f'[CHAPTER CONTENT]\n'
+            f'Write a detailed explanation of this chapter (400-800 words). No markdown.\n\n'
+            f'[NEW CHAPTER]\n'
+            f'Next Chapter Title\n'
+            f'[CHAPTER CONTENT]\n'
+            f'Content for next chapter...\n\n'
+            f'... (continue for 6-12 chapters)\n\n'
+            f'[EOF]\n\n'
+            f'IMPORTANT:\n'
+            f'- Exactly one [INTRODUCTION] block at the start.\n'
+            f'- Each chapter starts with [NEW CHAPTER] followed by the title on its own line, then [CHAPTER CONTENT] and the content.\n'
+            f'- End the whole document with [EOF].\n'
+            f'- No extra commentary, no markdown. Use plain text throughout.'
+        )
+        return self._add_tone_to_prompt(prompt)
 
-    def _parse_full_overview_response(self, text: str) -> Tuple[str, List[dict]]:
-        """Parse new‑style overview (introduction + chapters with content)."""
+    # ----- Parsers -----
+    def _parse_overview_response(self, text: str) -> Tuple[str, List[str]]:
+        """Parse old‑style JSON overview (introduction + chapter titles)."""
         text = text.strip()
         for fence in ("```json", "```"):
             if text.startswith(fence):
@@ -141,25 +131,52 @@ class BaseAIClient(ABC):
             raise RuntimeError("AI response 'chapters' must be a non-empty list")
         if not isinstance(data["introduction"], str):
             raise RuntimeError("AI response 'introduction' must be a string")
-        chapters = []
-        for item in data["chapters"]:
-            if not isinstance(item, dict) or "title" not in item or "content" not in item:
-                raise RuntimeError("Each chapter must have 'title' and 'content'")
-            chapters.append({"title": item["title"], "content": item["content"]})
-        return data["introduction"], chapters
+        return data["introduction"], data["chapters"]
 
-    # Old methods (kept for fallback / regeneration)
+    def _parse_tagged_overview(self, text: str) -> Tuple[str, List[dict]]:
+        """Parse tag‑based format, ignoring anything before [INTRODUCTION] and after [EOF]."""
+        text = text.strip()
+        for fence in ("```", "```text", "```plain"):
+            if text.startswith(fence):
+                text = text[len(fence):]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        intro_match = re.search(r'\[INTRODUCTION\]\s*(.*?)\s*(\[NEW CHAPTER\]|\[EOF\])', text, re.DOTALL)
+        if not intro_match:
+            raise RuntimeError("Missing [INTRODUCTION] tag")
+        introduction = intro_match.group(1).strip()
+
+        chapters = []
+        chapter_pattern = re.compile(
+            r'\[NEW CHAPTER\]\s*(.*?)\s*\[CHAPTER CONTENT\]\s*(.*?)\s*(?=\[NEW CHAPTER\]|\[EOF\]|$)',
+            re.DOTALL
+        )
+        for match in chapter_pattern.finditer(text):
+            title = match.group(1).strip()
+            content = match.group(2).strip()
+            if title and content:
+                chapters.append({"title": title, "content": content})
+
+        if not chapters:
+            raise RuntimeError("No valid chapters found; expected at least one [NEW CHAPTER]")
+        return introduction, chapters
+
+    # ----- API -----
     @abstractmethod
     def generate_overview(self, topic: str) -> Tuple[str, List[str]]:
+        """Old method: introduction + chapter titles only."""
         ...
 
     @abstractmethod
     def generate_node_content(self, node, root_title: str) -> str:
+        """Generate content for a single node."""
         ...
 
-    # New: full overview generation
     @abstractmethod
     def generate_full_overview(self, topic: str) -> Tuple[str, List[dict]]:
+        """Full generation: introduction + all chapter contents."""
         ...
 
     def generate_node_content_stream(self, node, root_title: str, callback: Callable[[str], None]) -> str:
@@ -178,7 +195,7 @@ class GeminiClient(BaseAIClient):
         super().__init__()
         self.api_key = api_key
         self._client = None
-        self.model = "gemini-2.5-flash"   # default to a model with quota
+        self.model = "gemini-2.5-flash"
 
     @property
     def client(self):
@@ -205,6 +222,7 @@ class GeminiClient(BaseAIClient):
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.4)
             )
+            self.last_raw_response = response.text
             return self._parse_overview_response(response.text)
         except RuntimeError:
             raise
@@ -220,6 +238,7 @@ class GeminiClient(BaseAIClient):
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.7)
             )
+            self.last_raw_response = response.text
             return response.text.strip()
         except Exception as e:
             raise RuntimeError(self._friendly_error(e)) from e
@@ -237,20 +256,22 @@ class GeminiClient(BaseAIClient):
             for chunk in stream:
                 full_text += chunk.text or ""
                 callback(full_text)
+            self.last_raw_response = full_text
             return full_text.strip()
         except Exception as e:
             raise RuntimeError(self._friendly_error(e)) from e
 
     def generate_full_overview(self, topic: str) -> Tuple[str, List[dict]]:
         from google.genai import types
-        prompt = self._build_full_overview_prompt(topic)
+        prompt = self._build_tagged_overview_prompt(topic)
         try:
             response = self.client.models.generate_content(
                 model=self.model,
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.4)
             )
-            return self._parse_full_overview_response(response.text)
+            self.last_raw_response = response.text
+            return self._parse_tagged_overview(response.text)
         except RuntimeError:
             raise
         except Exception as e:
@@ -283,11 +304,20 @@ class OllamaClient(BaseAIClient):
     def generate_overview(self, topic: str) -> Tuple[str, List[str]]:
         prompt = self._build_overview_prompt(topic)
         raw = self._chat(prompt, temperature=0.4)
+        self.last_raw_response = raw
+        raw = raw.strip()
+        for fence in ("```json", "```"):
+            if raw.startswith(fence):
+                raw = raw[len(fence):]
+        if raw.endswith("```"):
+            raw = raw[:-3]
         return self._parse_overview_response(raw)
 
     def generate_node_content(self, node, root_title: str) -> str:
         prompt = self._build_node_prompt(node, root_title)
-        return self._chat(prompt, temperature=0.7)
+        raw = self._chat(prompt, temperature=0.7)
+        self.last_raw_response = raw
+        return raw
 
     def generate_node_content_stream(self, node, root_title: str, callback: Callable[[str], None]) -> str:
         prompt = self._build_node_prompt(node, root_title)
@@ -309,12 +339,14 @@ class OllamaClient(BaseAIClient):
                     callback(full_text)
                 except json.JSONDecodeError:
                     pass
+        self.last_raw_response = full_text
         return full_text.strip()
 
     def generate_full_overview(self, topic: str) -> Tuple[str, List[dict]]:
-        prompt = self._build_full_overview_prompt(topic)
+        prompt = self._build_tagged_overview_prompt(topic)
         raw = self._chat(prompt, temperature=0.4)
-        return self._parse_full_overview_response(raw)
+        self.last_raw_response = raw
+        return self._parse_tagged_overview(raw)
 
     def get_model_display(self) -> str:
         return f"Ollama ({self.model})"
@@ -398,7 +430,7 @@ class ProjectManager:
 
 
 # ----------------------------------------------------------------------
-# Curses UI (modified initial generation)
+# Curses UI (with dual generation modes)
 # ----------------------------------------------------------------------
 class SpearheadApp:
     H_LINE, V_LINE = "─", "│"
@@ -407,7 +439,7 @@ class SpearheadApp:
     L_SPLIT, R_SPLIT = "├", "┤"
     B_SPLIT, T_SPLIT = "┴", "┬"
 
-    def __init__(self, stdscr, pm: ProjectManager, ai_client: BaseAIClient):
+    def __init__(self, stdscr, pm: ProjectManager, ai_client: BaseAIClient, verbose: bool = False):
         self.stdscr = stdscr
         self.pm = pm
         self.ai = ai_client
@@ -421,6 +453,7 @@ class SpearheadApp:
         self.generating_base_msg = ""
         self.ui_needs_update = False
         self._stream_timeout = 150
+        self.verbose = verbose
 
         self.height, self.width = stdscr.getmaxyx()
         if self.height < 10 or self.width < 40:
@@ -440,7 +473,7 @@ class SpearheadApp:
         if self.root.children:
             self.set_status("Project loaded. Select a node to begin.")
         else:
-            self.set_status("New project created. Press Enter on the root to generate overview.")
+            self.set_status("New project created. Press Enter on root for overview, 'f' for full content.")
 
     def set_status(self, msg: str, is_error: bool = False):
         self.status_msg = msg
@@ -555,7 +588,7 @@ class SpearheadApp:
         content = self.current_node.content
         if not content:
             if self.current_node.is_root() and not self.current_node.children:
-                content = "Welcome to Spearhead!\n\nPress Enter to generate the learning overview for this topic."
+                content = "Welcome to Spearhead!\n\nPress Enter to generate the learning overview.\nPress 'f' to generate the full overview with all chapter content."
             else:
                 content = "[No content yet. Press Enter to generate.]"
         max_w = w - 1
@@ -582,7 +615,7 @@ class SpearheadApp:
         y, x, h, w = self._footer_area()
         model_str = self.ai.get_model_display()
         help_text = (
-            "[↑/↓] nav  [Enter] gen  [a] add  [d] del  "
+            "[↑/↓] nav  [Enter] gen  [f] full gen  [a] add  [d] del  "
             "[r] regen  [h/l] collapse/expand  [←/→] pgup/pgdn content  "
             "[PgUp/PgDn] also scroll  [m] model  [s] save + export  [q] quit"
         )
@@ -646,6 +679,8 @@ class SpearheadApp:
                     self.toggle_collapse(False)
             elif key == ord('\n') or key == ord(' '):
                 self.ensure_node_content()
+            elif key == ord('f'):
+                self.full_generation()
             elif key == ord('a'):
                 self.add_argument()
             elif key == ord('d'):
@@ -664,7 +699,6 @@ class SpearheadApp:
             self.draw_all()
 
     def save_and_export(self):
-        """Save project, then launch PDF export and capture outcome."""
         self.pm.save()
         self.set_status(f"Saved to {self.pm.filepath}. Exporting PDF...")
         self.draw_all()
@@ -740,12 +774,57 @@ class SpearheadApp:
             self.current_node.collapsed = collapse
 
     # ------------------------------------------------------------------
-    # AI generation (major change: full initial overview)
+    # AI generation – dual mode
     # ------------------------------------------------------------------
-    def generate_initial_overview(self):
-        """Generate introduction + all chapter contents in a single API call."""
+    def _write_ai_log(self, raw_text: str):
+        if not self.verbose:
+            return
+        log_path = str(self.pm.filepath).replace('.json', '.ai.log')
+        try:
+            with open(log_path, 'w', encoding='utf-8') as lf:
+                lf.write(raw_text)
+        except Exception:
+            pass
+
+    def generate_initial_overview_old(self):
+        """Old method: introduction + chapter titles only."""
         self.generating = True
-        self.generating_base_msg = "Generating full overview (introduction + all chapters)..."
+        self.generating_base_msg = "Generating overview (introduction + chapter titles)..."
+        self.set_status(self.generating_base_msg)
+        self.draw_all()
+
+        def task():
+            retrying = False
+            try:
+                intro, chapters = self.ai.generate_overview(self.root.title)
+                self._write_ai_log(self.ai.last_raw_response)
+                chap_list = "\n".join(f"• {ch}" for ch in chapters)
+                self.root.content = f"{intro}\n\n**Chapters:**\n{chap_list}"
+                for ch_title in chapters:
+                    chap_node = Node(ch_title, node_type="chapter", parent=self.root)
+                    # content remains empty – user must expand individually
+                    self.root.children.append(chap_node)
+                self.current_node = self.root
+                self.pm.save()
+                self.set_status("Overview generated. Select a chapter and press Enter to expand.")
+            except Exception as e:
+                retrying = self._handle_ai_error(e, "overview")
+            finally:
+                if not retrying:
+                    self.generating = False
+                    self.draw_all()
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def full_generation(self):
+        """'f' key – generate introduction + all chapter contents in one request."""
+        if self.current_node != self.root:
+            self.set_status("Full generation only available on the root node.", is_error=True)
+            self.draw_all()
+            return
+
+        self.generating = True
+        self.generating_base_msg = "Generating full overview (introduction + all chapter content)..."
         self.set_status(self.generating_base_msg)
         self.draw_all()
 
@@ -753,12 +832,14 @@ class SpearheadApp:
             retrying = False
             try:
                 intro, chapters_data = self.ai.generate_full_overview(self.root.title)
-                # Root content = introduction + list of chapters
+                self._write_ai_log(self.ai.last_raw_response)
                 chap_list = "\n".join(f"• {ch['title']}" for ch in chapters_data)
                 self.root.content = f"{intro}\n\n**Chapters:**\n{chap_list}"
+                # Clear existing children (if any)
+                self.root.children.clear()
                 for ch in chapters_data:
                     chap_node = Node(ch['title'], node_type="chapter", parent=self.root)
-                    chap_node.content = ch['content']      # content already generated
+                    chap_node.content = ch['content']
                     self.root.children.append(chap_node)
                 self.current_node = self.root
                 self.pm.save()
@@ -773,15 +854,17 @@ class SpearheadApp:
         threading.Thread(target=task, daemon=True).start()
 
     def ensure_node_content(self):
-        """If root empty, generate full overview. Otherwise, if a chapter/argument has no content, generate it individually (streaming)."""
-        if self.current_node.is_root() and not self.current_node.content and not self.current_node.children:
-            self.generate_initial_overview()
+        """Enter / space: generate content for the current node if empty.
+        For the root, uses the old overview (titles only) if it has no children."""
+        if self.current_node.is_root() and not self.current_node.children:
+            # New project – old method
+            self.generate_initial_overview_old()
             return
         if self.current_node.content:
             self.set_status("Node already has content. Press 'r' to regenerate.")
             self.draw_all()
             return
-        # For any other empty node, use normal streaming generation
+        # For any other empty node, use streaming generation
         self._start_streaming_generation()
 
     def regenerate_node(self):
@@ -792,7 +875,6 @@ class SpearheadApp:
         self._start_streaming_generation()
 
     def _start_streaming_generation(self):
-        """Generate content for a single node (chapter or argument) with streaming."""
         self.generating = True
         self.ui_needs_update = False
         self.generating_base_msg = f"Generating content for '{self.current_node.title}'..."
@@ -812,6 +894,7 @@ class SpearheadApp:
                 final = self.ai.generate_node_content_stream(node, root_title, callback)
                 node.content = final
                 self.pm.save()
+                self._write_ai_log(self.ai.last_raw_response)
                 self.set_status("Content generated.")
             except Exception as e:
                 retrying = self._handle_ai_error(e, "generation")
@@ -836,7 +919,7 @@ class SpearheadApp:
                     self.ai.set_tone(old_tone)
                     self.set_status(f"Quota exceeded. Switched to local model ({self.ai.get_model_display()}). Retrying...")
                     if action == "overview":
-                        self.generate_initial_overview()
+                        self.generate_initial_overview_old()
                     else:
                         self._start_streaming_generation()
                     return True
@@ -1051,7 +1134,7 @@ def browse_existing_project() -> Optional[str]:
 
 
 # ----------------------------------------------------------------------
-# Entry point (unchanged)
+# Entry point
 # ----------------------------------------------------------------------
 def load_tone_file(tone_path: str) -> Optional[str]:
     if not tone_path:
@@ -1062,7 +1145,7 @@ def load_tone_file(tone_path: str) -> Optional[str]:
     with open(path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
-def main(stdscr, project_file, topic, local, local_model, tone_text):
+def main(stdscr, project_file, topic, local, local_model, tone_text, verbose):
     if local or not os.environ.get("GEMINI_API_KEY"):
         ai = OllamaClient(model=local_model or "gemma3:1b")
     else:
@@ -1077,7 +1160,7 @@ def main(stdscr, project_file, topic, local, local_model, tone_text):
     else:
         pm = ProjectManager.new_project(topic)
 
-    app = SpearheadApp(stdscr, pm, ai)
+    app = SpearheadApp(stdscr, pm, ai, verbose=verbose)
     app.run()
 
 if __name__ == "__main__":
@@ -1088,7 +1171,7 @@ if __name__ == "__main__":
     parser.add_argument("--local", action="store_true", help="Force use of local Ollama model")
     parser.add_argument("--local-model", default="gemma3:1b", help="Ollama model name (default: gemma3:1b)")
     parser.add_argument("--tone-file", help="Path to a file containing tone/style instructions for the AI")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print export logs after quitting")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print AI and export logs after quitting")
     args = parser.parse_args()
 
     tone_text = None
@@ -1121,12 +1204,18 @@ if __name__ == "__main__":
             print("Invalid choice.")
             sys.exit(0)
 
-    curses.wrapper(main, project_file, topic, args.local, args.local_model, tone_text)
+    curses.wrapper(main, project_file, topic, args.local, args.local_model, tone_text, args.verbose)
 
-    # If verbose, print the export log (if it exists)
+    # If verbose, print export and AI logs
     if args.verbose and project_file:
         log_path = project_file.replace('.json', '.export.log')
         if os.path.exists(log_path):
             print("\n===== EXPORT LOG =====")
             with open(log_path, 'r', encoding='utf-8') as lf:
+                print(lf.read())
+
+        ai_log_path = project_file.replace('.json', '.ai.log')
+        if os.path.exists(ai_log_path):
+            print("\n===== RAW AI OUTPUT =====")
+            with open(ai_log_path, 'r', encoding='utf-8') as lf:
                 print(lf.read())
