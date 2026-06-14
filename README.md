@@ -1,4 +1,4 @@
-# Spearhead
+# 🔱 Spearhead
 
 A terminal‑based learning tool. 
 Generate an interactive knowledge tree on any topic, with content produced by Google Gemini **or** local Ollama models.  
