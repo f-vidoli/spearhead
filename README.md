@@ -1,6 +1,6 @@
 # Spearhead
 
-A terminal‑based learning tool using the *spear & expand* method.  
+A terminal‑based learning tool. 
 Generate an interactive knowledge tree on any topic, with content produced by Google Gemini **or** local Ollama models.  
 Read, expand, add your own arguments, and export everything to a beautiful PDF on Google Drive – all from the keyboard.
 
@@ -9,7 +9,6 @@ Read, expand, add your own arguments, and export everything to a beautiful PDF o
 - **Spear & Expand** – AI generates an overview + full chapter contents in *one* request, then you dive deeper by adding arguments.
 - **Local & Cloud AI** – Switch seamlessly between Google Gemini and any Ollama model (all your local models are listed automatically).
 - **Custom Tone** – Create a `~/.spearhead_tone` file and the AI will adopt your preferred writing style.
-- **Streaming Content** – Watch the AI write in real time.
 - **Single‑Key Export** – Press `s` to save your project **and** instantly create a LaTeX‑rendered PDF, saved locally **and** uploaded to a dedicated “Spearhead PDFs” folder on Google Drive.
 - **Project Browser** – Open any previous project from a simple terminal menu.
 - **Keyboard‑Driven Navigation** – tree navigation, content scrolling with left/right arrows, model switching, node deletion – no mouse needed.
@@ -45,10 +44,10 @@ export GEMINI_API_KEY="your-api-key"
 python spearhead.py
 
 # Or start with a topic immediately
-python spearhead.py --topic "Quantum Physics"
+python spearhead.py --topic "Bread allergies in Luxemburg"
 
 # Force using a local model
-python spearhead.py --topic "Ethics of AI" --local --local-model gemma3:1b
+python spearhead.py --topic "Bananas in the 1980s" --local --local-model gemma3:1b
 ```
 
 **Inside the app:**
@@ -83,7 +82,7 @@ Write any style instructions (see `example-tone.txt`). They will be appended to 
 
 ## Verbose Mode
 
-Add `-v` to print full export logs after quitting, useful for debugging:
+Add `-v` to print full export logs, useful for debugging:
 
 ```
 python spearhead.py --topic "Renaissance Art" -v
